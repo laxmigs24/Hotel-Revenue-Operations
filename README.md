@@ -59,8 +59,7 @@ A lower, trustworthy number beats a higher, broken one.
 ├── data/                             # raw + intermediate + processed CSVs
 ├── .github/workflows/tests.yml       # CI: runs tests + executes all notebooks on every push
 ├── requirements.txt
-├── LICENSE
-└── CHANGELOG.md                      # what was fixed, and why
+├── LICENSE                     
 ```
 
 ## Getting started
