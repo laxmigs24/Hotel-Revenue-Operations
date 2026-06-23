@@ -38,7 +38,7 @@ st.set_page_config(
 APP_DIR  = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR.parent
 
-MODEL_PATH = PROJECT_DIR / "models" / "xgboost_cancellation_model_bundle.joblib"
+MODEL_PATH = PROJECT_DIR / "models" / "cancellation_model.joblib"
 DATA_PATH  = PROJECT_DIR / "data"  / "hotel_bookings_feature_engineered.csv"
 
 
@@ -373,7 +373,15 @@ def get_bundle_value(bundle: Dict[str, Any], keys: List[str], default: Any = Non
     return default
 
 
-model_name = get_bundle_value(model_bundle, ["model_name"], "XGBoost")
+model_name = get_bundle_value(model_bundle, ["model_name"], "Gradient Boosting (HistGB)")
+
+# NOTE: the corrected notebook 04 saves a single, already-fitted
+# sklearn Pipeline (preprocessing + classifier combined) under the key
+# "pipeline", rather than separate "model" and "preprocessor" objects.
+# We support both shapes for backward compatibility, since someone
+# re-running the original-style notebook could still produce the old
+# bundle format.
+fitted_pipeline = get_bundle_value(model_bundle, ["pipeline"], None)
 
 model = get_bundle_value(
     model_bundle, ["model", "best_model", "xgb_model", "classifier"],
@@ -399,18 +407,34 @@ model_metrics: Dict[str, Any] = get_bundle_value(
     ["model_metrics", "metrics", "evaluation_metrics"],
     {},
 )
+if "test_auc" in model_bundle and "roc_auc" not in model_metrics:
+    model_metrics = {**model_metrics, "roc_auc": model_bundle["test_auc"]}
 
-for label, obj, key in [
-    ("model",        model,        None),
-    ("preprocessor", preprocessor, None),
-]:
-    if obj is None:
-        st.error(f"⚠️ `{label}` object not found inside the saved bundle. Re-run notebook 04.")
-        st.stop()
+# Leakage-risk features that must NEVER be collected from the user or fed
+# to the model, even if present as columns in the historical dataset used
+# for the dashboard view. See notebook 03's "Leakage Review" section for
+# the full rationale (room_type_changed proxies "booking was not
+# cancelled" rather than a genuine booking-time risk signal).
+EXCLUDED_LEAKAGE_FEATURES: List[str] = get_bundle_value(
+    model_bundle, ["excluded_features_leakage_risk"], ["room_type_changed", "reserved_room_type", "assigned_room_type"]
+)
+
+if fitted_pipeline is not None:
+    # Single combined pipeline -- this is what the corrected notebook 04 saves.
+    model = fitted_pipeline
+    preprocessor = None  # not used as a separate step; pipeline handles it internally
+elif model is None or preprocessor is None:
+    st.error("⚠️ Could not find a usable model in the saved bundle. Re-run notebook 04.")
+    st.stop()
 
 if not model_features:
     st.error("⚠️ Feature list not found inside the saved bundle. Re-run notebook 04.")
     st.stop()
+
+# Safety net: even if an old-style bundle somehow still lists a leakage
+# feature, strip it from the working feature list here so the app can
+# never ask the user for it.
+model_features = [f for f in model_features if f not in EXCLUDED_LEAKAGE_FEATURES]
 
 
 # ============================================================
@@ -496,41 +520,69 @@ def borderline(probability: float) -> bool:
 # ============================================================
 # FEATURE ENGINEERING HELPERS
 # ============================================================
+#
+# FIX: this app previously defined its own copies of `lead_time_bucket`,
+# `adr_bucket`, `arrival_season_from_month`, and `stay_length_category`,
+# completely independently from the notebooks. The label sets disagreed
+# with BOTH each other and the model's training data (e.g. the app
+# produced "Last minute" / "Zero ADR" while training data used
+# "0-30 Days" / "0-50"), so every manual prediction silently fed
+# unrecognized category strings into the model's OrdinalEncoder, which
+# mapped them all to "unknown" (-1) without raising an error.
+#
+# The fix is to import the exact same bucket boundaries and labels the
+# notebooks use, from the single shared module `src/features.py`, so the
+# app and the trained model can never drift apart again.
+
+import sys as _sys
+_sys.path.insert(0, str(PROJECT_DIR))
+from src import features as feat  # noqa: E402
+
+MONTH_NAMES = feat.MONTH_NAMES
+
 
 def arrival_season_from_month(m: int) -> str:
-    if m in [12, 1, 2]: return "Winter"
-    if m in [3,  4, 5]: return "Spring"
-    if m in [6,  7, 8]: return "Summer"
-    return "Autumn"
-
-
-MONTH_NAMES = {
-    1:"January",2:"February",3:"March",4:"April",5:"May",6:"June",
-    7:"July",8:"August",9:"September",10:"October",11:"November",12:"December",
-}
+    month_name = MONTH_NAMES.get(m)
+    return feat.assign_season(month_name) if month_name else "Unknown"
 
 
 def lead_time_bucket(lt: int) -> str:
-    if lt <= 7:   return "Last minute"
-    if lt <= 30:  return "Short lead"
-    if lt <= 90:  return "Medium lead"
-    if lt <= 180: return "Long lead"
-    return "Very long lead"
+    """Identical bucketing to src.features.add_lead_time_bucket, applied
+    to a single value instead of a full Series.
+    """
+    bucketed = pd.cut(
+        pd.Series([lt]), bins=feat.LEAD_TIME_BINS, labels=feat.LEAD_TIME_LABELS, include_lowest=True
+    )
+    return str(bucketed.iloc[0])
 
 
 def adr_bucket(adr: float) -> str:
-    if adr <= 0:    return "Zero ADR"
-    if adr < 75:    return "Low ADR"
-    if adr < 150:   return "Medium ADR"
-    return "High ADR"
+    """Identical bucketing to src.features.add_adr_bucket, including the
+    same negative-ADR handling, applied to a single value.
+    """
+    if adr < 0:
+        return "Invalid ADR"
+    bucketed = pd.cut(
+        pd.Series([adr]), bins=feat.ADR_BINS, labels=feat.ADR_LABELS, include_lowest=True
+    )
+    result = bucketed.iloc[0]
+    return "Invalid ADR" if pd.isna(result) else str(result)
 
 
 def stay_length_category(nights: int) -> str:
-    if nights == 0: return "Zero-night stay"
-    if nights <= 2: return "Short stay"
-    if nights <= 5: return "Medium stay"
-    if nights <= 10: return "Long stay"
-    return "Extended stay"
+    """Identical logic to src.features.add_stay_length_category, applied
+    to a single value instead of a Series.
+    """
+    if nights == 0:
+        return "Zero-night stay"
+    elif nights <= 2:
+        return "Short stay"
+    elif nights <= 5:
+        return "Medium stay"
+    elif nights <= 10:
+        return "Long stay"
+    else:
+        return "Extended stay"
 
 
 # ============================================================
@@ -591,11 +643,19 @@ def build_manual_feature_row(
     hotel, lead_time, arrival_year, arrival_month_number, arrival_day_of_month,
     stays_in_weekend_nights, stays_in_week_nights, adults, children, babies,
     meal, country, market_segment, distribution_channel, is_repeated_guest,
-    previous_cancellations, previous_bookings_not_canceled, reserved_room_type,
-    assigned_room_type, booking_changes, deposit_type, agent, company,
+    previous_cancellations, previous_bookings_not_canceled,
+    booking_changes, deposit_type, agent, company,
     days_in_waiting_list, customer_type, adr, required_car_parking_spaces,
     total_of_special_requests,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # NOTE: `reserved_room_type` / `assigned_room_type` / `room_type_changed`
+    # were removed from this function's parameters. They were previously
+    # collected from the manual-entry form, but they are excluded from the
+    # model as leakage-risk features (see notebook 03 "Leakage Review"):
+    # `assigned_room_type` is typically only known at/near check-in, so a
+    # manager scoring a brand-new booking cannot honestly provide it, and
+    # historically it behaved as a proxy for "this booking was not
+    # cancelled" rather than a genuine booking-time risk signal.
 
     total_nights = stays_in_weekend_nights + stays_in_week_nights
     estimated_booking_value = adr * total_nights
@@ -624,8 +684,6 @@ def build_manual_feature_row(
         "is_repeated_guest": is_repeated_guest,
         "previous_cancellations": previous_cancellations,
         "previous_bookings_not_canceled": previous_bookings_not_canceled,
-        "reserved_room_type": reserved_room_type,
-        "assigned_room_type": assigned_room_type,
         "booking_changes": booking_changes,
         "deposit_type": deposit_type,
         "agent": agent, "company": company,
@@ -634,13 +692,15 @@ def build_manual_feature_row(
         "adr": adr,
         "required_car_parking_spaces": required_car_parking_spaces,
         "total_of_special_requests": total_of_special_requests,
-        # engineered
+        # engineered -- all via the canonical bucket functions imported
+        # from src/features.py (wrapped above), so these labels are
+        # guaranteed to match what the model was trained on.
         "lead_time_bucket": lead_time_bucket(lead_time),
-        "is_last_minute_booking": 1 if lead_time <= 7 else 0,
-        "is_long_lead_booking": 1 if lead_time >= 90 else 0,
+        "is_last_minute_booking": 1 if lead_time <= feat.LAST_MINUTE_LEAD_DAYS else 0,
+        "is_long_lead_booking": 1 if lead_time >= feat.LONG_LEAD_DAYS else 0,
         "arrival_month_number": arrival_month_number,
         "arrival_season": arrival_season_from_month(arrival_month_number),
-        "is_peak_season": 1 if arrival_month_number in [6,7,8,9] else 0,
+        "is_peak_season": 1 if MONTH_NAMES[arrival_month_number] in feat.PEAK_SEASON_MONTHS else 0,
         "total_nights": total_nights,
         "is_zero_night_stay": 1 if total_nights == 0 else 0,
         "is_weekend_stay": 1 if stays_in_weekend_nights > 0 else 0,
@@ -658,9 +718,8 @@ def build_manual_feature_row(
         "adr_bucket": adr_bucket(adr),
         "has_invalid_adr": 1 if adr < 0 else 0,
         "is_zero_adr": 1 if adr == 0 else 0,
-        "is_high_adr": 1 if adr >= 150 else 0,
+        "is_high_adr": 1 if adr >= df["adr"].quantile(0.75) else 0,
         "is_high_value_booking": 1 if estimated_booking_value >= df["estimated_booking_value"].quantile(0.75) else 0,
-        "room_type_changed": 1 if reserved_room_type != assigned_room_type else 0,
     }
 
     manual_df = pd.DataFrame([row])
@@ -697,14 +756,24 @@ def _align_features(working_df: pd.DataFrame) -> pd.DataFrame:
     return working_df
 
 
+def _predict_proba(X_input: pd.DataFrame) -> np.ndarray:
+    """Single entry point for scoring, supporting both bundle shapes:
+    a combined fitted Pipeline ("pipeline" key), or legacy separate
+    preprocessor + model objects. See bundle extraction section above.
+    """
+    if fitted_pipeline is not None:
+        return fitted_pipeline.predict_proba(X_input)[:, 1]
+    X_processed = preprocessor.transform(X_input)
+    return model.predict_proba(X_processed)[:, 1]
+
+
 def predict_bookings(input_df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """Returns (scored_df, error_message). error_message is None on success."""
     try:
         working_df = enrich_dataframe(input_df.copy())
         working_df = _align_features(working_df)
         X_input = working_df[model_features].copy()
-        X_processed = preprocessor.transform(X_input)
-        probabilities = model.predict_proba(X_processed)[:, 1]
+        probabilities = _predict_proba(X_input)
         predictions   = (probabilities >= selected_threshold).astype(int)
         scored = working_df.copy()
         scored["predicted_cancellation_probability"] = probabilities
@@ -723,8 +792,7 @@ def predict_manual_booking(
     manual_full_df:  pd.DataFrame,
 ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     try:
-        X_processed  = preprocessor.transform(manual_model_df)
-        probability  = float(model.predict_proba(X_processed)[:, 1][0])
+        probability  = float(_predict_proba(manual_model_df)[0])
         prediction   = int(probability >= selected_threshold)
         result_df    = manual_full_df.copy()
         result_df["predicted_cancellation_probability"] = probability
@@ -747,10 +815,24 @@ def get_shap_explainer():
     if not SHAP_AVAILABLE:
         return None
     try:
-        explainer = shap.TreeExplainer(model)
+        # With the combined-pipeline bundle shape, SHAP's TreeExplainer
+        # needs the tree classifier itself, not the full Pipeline (which
+        # includes preprocessing steps TreeExplainer doesn't understand).
+        tree_model = fitted_pipeline.named_steps["classifier"] if fitted_pipeline is not None else model
+        explainer = shap.TreeExplainer(tree_model)
         return explainer
     except Exception:
         return None
+
+
+def _transform_for_shap(manual_model_df: pd.DataFrame):
+    """Apply just the preprocessing step (not the classifier) so SHAP can
+    operate on the same transformed feature space the tree model was
+    trained on.
+    """
+    if fitted_pipeline is not None:
+        return fitted_pipeline.named_steps["preprocessor"].transform(manual_model_df)
+    return preprocessor.transform(manual_model_df)
 
 
 def get_shap_drivers(manual_model_df: pd.DataFrame, top_n: int = 6) -> Optional[List[Tuple[str, float]]]:
@@ -759,7 +841,7 @@ def get_shap_drivers(manual_model_df: pd.DataFrame, top_n: int = 6) -> Optional[
     if explainer is None:
         return None
     try:
-        X_proc = preprocessor.transform(manual_model_df)
+        X_proc = _transform_for_shap(manual_model_df)
         shap_values = explainer.shap_values(X_proc)
         if isinstance(shap_values, list):
             sv = shap_values[1][0]
@@ -799,11 +881,6 @@ def get_risk_drivers_rules(row: pd.Series) -> List[str]:
     try:
         if float(safe_value(row, "previous_cancellations", 0)) > 0:
             drivers.append("Guest has a previous cancellation in their booking history.")
-    except Exception:
-        pass
-    try:
-        if float(safe_value(row, "room_type_changed", 0)) == 1:
-            drivers.append("Reserved and assigned room types differ — this is a meaningful model signal.")
     except Exception:
         pass
     try:
@@ -1283,9 +1360,14 @@ if mode == "🔮 Predict New Booking":
 
         with col6:
             previous_bookings_not_canceled = st.number_input("Previous successful stays", min_value=0, max_value=100, value=0)
-            reserved_room_type = st.selectbox("Reserved room type", ["A","B","C","D","E","F","G","H","L","P"])
-            assigned_room_type = st.selectbox("Assigned room type", ["A","B","C","D","E","F","G","H","L","P"])
             booking_changes    = st.number_input("Booking changes made", min_value=0, max_value=30, value=0)
+            st.markdown(
+                '<div class="small-note">Note: room type fields are intentionally not collected here. '
+                'The assigned room is normally only finalized by hotel staff at or near check-in, so it '
+                'isn\'t honestly knowable for a not-yet-arrived booking — see the project README for why '
+                'this feature was excluded from the model.</div>',
+                unsafe_allow_html=True,
+            )
 
         # ── Section 3: Operational Details (collapsed by default in the form) ──
         st.markdown('<div class="section-title" style="font-size:1.4rem;">Operational Details</div>', unsafe_allow_html=True)
@@ -1335,8 +1417,6 @@ if mode == "🔮 Predict New Booking":
                     is_repeated_guest=int(is_repeated_guest),
                     previous_cancellations=int(previous_cancellations),
                     previous_bookings_not_canceled=int(previous_bookings_not_canceled),
-                    reserved_room_type=reserved_room_type,
-                    assigned_room_type=assigned_room_type,
                     booking_changes=int(booking_changes),
                     deposit_type=deposit_type, agent=int(agent), company=int(company),
                     days_in_waiting_list=int(days_in_waiting_list),
@@ -1467,7 +1547,7 @@ if mode == "🔮 Predict New Booking":
             signal_cols = [
                 "hotel","market_segment","customer_type","lead_time","lead_time_bucket",
                 "arrival_season","total_nights","stay_length_category","adr","adr_bucket",
-                "deposit_type","estimated_booking_value","room_type_changed",
+                "deposit_type","estimated_booking_value",
                 "previous_cancellation_rate","has_special_requests","is_weekend_stay",
             ]
             avail = [c for c in signal_cols if c in result_df.columns]
