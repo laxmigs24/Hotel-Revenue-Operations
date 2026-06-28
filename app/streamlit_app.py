@@ -11,6 +11,27 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+# ── Auto-rebuild model if bundle is missing or version-incompatible ──
+import os, sys
+
+def _ensure_model_exists():
+    model_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "models", "cancellation_model.joblib"
+    )
+    if os.path.exists(model_path):
+        try:
+            import joblib
+            joblib.load(model_path)
+            return  # bundle loads fine, nothing to do
+        except Exception:
+            pass  # incompatible bundle — rebuild below
+    # Bundle missing or broken — train from scratch on this environment
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from train_model import build_and_save
+    build_and_save()
+
+_ensure_model_exists()
 
 try:
     import shap
