@@ -75,7 +75,6 @@ Hotel-Revenue-Operations/
 │   └── test_features.py          # 16 regression tests — run without pytest
 │
 ├── requirements.txt
-├── CHANGELOG.md
 ├── LICENSE
 └── README.md
 ```
