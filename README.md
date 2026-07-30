@@ -1,4 +1,8 @@
 # Hotel Revenue Operations
+<img width="1659" height="725" alt="Screenshot 2026-07-30 at 13 02 53" src="https://github.com/user-attachments/assets/56030652-8cb0-4d19-beb0-f4ce1365520f" />
+<img width="1657" height="345" alt="Screenshot 2026-07-30 at 13 03 07" src="https://github.com/user-attachments/assets/c1242795-efe7-4da2-a380-4e09d1017797" />
+
+
 ### Cancellation Risk Prediction & Revenue Intelligence for Hotel Managers
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python)](https://python.org)
